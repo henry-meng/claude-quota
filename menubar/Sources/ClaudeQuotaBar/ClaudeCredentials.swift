@@ -48,6 +48,18 @@ struct ClaudeCredentials {
     }
 }
 
+/// Lock-guarded box for the loaded credential. `load()` is called from the
+/// refresh task, not the main actor, so the storage has to be safe on its own.
+private final class CredentialCache: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: ClaudeCredentials?
+
+    var value: ClaudeCredentials? {
+        get { lock.withLock { stored } }
+        set { lock.withLock { stored = newValue } }
+    }
+}
+
 /// Reads Claude Code's stored login.
 ///
 /// This is strictly read-only. We never write, refresh, or rotate the
@@ -62,43 +74,120 @@ enum ClaudeCredentialStore {
     /// The Keychain service name Claude Code writes under on macOS.
     private static let keychainService = "Claude Code-credentials"
 
+    /// Cached so a poll doesn't touch the Keychain.
+    ///
+    /// Reading a Keychain item is access-controlled per signature. Doing it on
+    /// every refresh means macOS can put an authorisation prompt on screen
+    /// once a minute, which is unusable. Read once, hold it until the token
+    /// expires or a request comes back 401, then read again.
+    private static let cache = CredentialCache()
+
     static func load() -> ClaudeCredentials? {
-        for data in keychainCandidates() {
-            if let credentials = parse(data) { return credentials }
+        let previous = cache.value
+
+        if let cached = previous, !cached.isExpired {
+            Log.credentials.notice("load: using cached credential (fp \(Log.fingerprint(cached.accessToken), privacy: .public), expires in \(Log.secondsUntil(cached.expiresAt), privacy: .public)s)")
+            return cached
         }
+
+        if let stale = previous {
+            Log.credentials.notice("load: cached credential expired (fp \(Log.fingerprint(stale.accessToken), privacy: .public), expired \(Log.secondsUntil(stale.expiresAt), privacy: .public)s) — re-reading Keychain")
+        }
+
+        let candidates = keychainCandidates()
+        Log.credentials.notice("load: Keychain returned \(candidates.count, privacy: .public) blob(s)")
+
+        for data in candidates {
+            if let credentials = parse(data) {
+                let fp = Log.fingerprint(credentials.accessToken)
+                // The decisive datum: if this matches the expired one we just
+                // dropped, Claude Code has not renewed and waiting is correct.
+                // If it differs and we are still reporting expired, the bug is
+                // ours.
+                let changed = previous.map { Log.fingerprint($0.accessToken) != fp } ?? true
+                Log.credentials.notice("load: parsed credential from Keychain (fp \(fp, privacy: .public), expires in \(Log.secondsUntil(credentials.expiresAt), privacy: .public)s, expired=\(credentials.isExpired, privacy: .public), changedFromCached=\(changed, privacy: .public))")
+                cache.value = credentials
+                return credentials
+            }
+        }
+
+        Log.credentials.error("load: no parseable credential in \(candidates.count, privacy: .public) blob(s)")
+        cache.value = nil
         return nil
     }
 
-    /// Every Keychain item under our service, current user's first.
+    /// Drop the cached credential so the next `load()` goes back to the
+    /// Keychain. Called when the server rejects the token we hold.
+    static func invalidate() {
+        if let held = cache.value {
+            Log.credentials.notice("invalidate: dropping credential fp \(Log.fingerprint(held.accessToken), privacy: .public) after server rejection")
+        }
+        cache.value = nil
+    }
+
+    /// Every Keychain blob under our service, the current user's first.
     ///
-    /// Claude Code keys the item by macOS username. Asking for a single match
-    /// and taking whatever came back first meant that a second item — another
-    /// account, or a leftover from a previous login — could silently hand us
-    /// someone else's quota. Order by account instead, and let the caller keep
-    /// walking if the first blob doesn't parse.
+    /// Claude Code keys the item by macOS username. Taking a single match and
+    /// whatever came back first meant a second item (another account, or a
+    /// leftover login) could silently hand us someone else's quota.
+    ///
+    /// This takes two queries, not one. `kSecMatchLimitAll` together with
+    /// `kSecReturnData` is rejected outright with `errSecParam`: the Keychain
+    /// returns attributes for many items, or data for one, never data for
+    /// many. So list the accounts first, then fetch each blob on its own.
     private static func keychainCandidates() -> [Data] {
-        let query: [String: Any] = [
+        var accounts = accountNames()
+
+        let currentUser = NSUserName()
+        if let index = accounts.firstIndex(of: currentUser) {
+            accounts.remove(at: index)
+            accounts.insert(currentUser, at: 0)
+        }
+
+        let candidates = accounts.compactMap { blob(forAccount: $0) }
+        if !candidates.isEmpty { return candidates }
+
+        // No account attribute to match on, or none of them resolved. Fall
+        // back to "whatever is under this service".
+        return [blob(forAccount: nil)].compactMap { $0 }
+    }
+
+    /// Attributes only. Legal with `kSecMatchLimitAll`.
+    static func accountsQuery() -> [String: Any] {
+        [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: keychainService,
-            kSecReturnData as String: true,
             kSecReturnAttributes as String: true,
             kSecMatchLimit as String: kSecMatchLimitAll
         ]
+    }
 
+    /// Data for exactly one item. Legal only with `kSecMatchLimitOne`.
+    static func blobQuery(account: String?) -> [String: Any] {
+        var query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: keychainService,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        if let account { query[kSecAttrAccount as String] = account }
+        return query
+    }
+
+    private static func accountNames() -> [String] {
         var result: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+        guard SecItemCopyMatching(accountsQuery() as CFDictionary, &result) == errSecSuccess,
               let items = result as? [[String: Any]] else {
             return []
         }
+        return items.compactMap { $0[kSecAttrAccount as String] as? String }
+    }
 
-        // A partition rather than `sorted`: "is mine" is not a strict weak
-        // ordering, and Swift's sort is undefined for predicates that aren't.
-        let currentUser = NSUserName()
-        let isCurrentUser = { (item: [String: Any]) in
-            item[kSecAttrAccount as String] as? String == currentUser
-        }
-        let ordered = items.filter(isCurrentUser) + items.filter { !isCurrentUser($0) }
-        return ordered.compactMap { $0[kSecValueData as String] as? Data }
+    private static func blob(forAccount account: String?) -> Data? {
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(blobQuery(account: account) as CFDictionary, &result) == errSecSuccess
+        else { return nil }
+        return result as? Data
     }
 
     /// The stored blob is `{"claudeAiOauth": {"accessToken": ..., "expiresAt": <ms>}}`.

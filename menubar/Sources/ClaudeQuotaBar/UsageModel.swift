@@ -139,18 +139,28 @@ final class UsageModel: ObservableObject {
     }
 
     private func performRefresh(force: Bool) async {
+        Log.refresh.notice("refresh: begin (force=\(force, privacy: .public))")
+
         // 1. Local cache first — free, and current whenever a session is open.
         let cached = StatusLineCache.read()
         if let cached {
+            Log.refresh.notice("refresh: status line cache present, age \(Int(cached.snapshot.age), privacy: .public)s")
             adopt(cached.snapshot, context: cached.context)
             if cached.snapshot.age < Defaults.cacheStaleAfter && !force {
                 lastError = nil
+                Log.refresh.notice("refresh: cache is fresh — no network call")
                 return
             }
+        } else {
+            // Expected only when the status line integration is not installed.
+            // In that state every refresh falls through to the rate-limited
+            // OAuth endpoint, which is not what the design intends.
+            Log.refresh.notice("refresh: no status line cache — falling through to OAuth")
         }
 
         guard oauthFallbackEnabled else {
             lastError = cached == nil ? .noData : nil
+            Log.refresh.notice("refresh: OAuth fallback disabled — stopping")
             return
         }
 
@@ -159,11 +169,13 @@ final class UsageModel: ObservableObject {
         // rate limits hard. Anything we already hold this recent is good enough.
         if !force, let snapshot, snapshot.age < Defaults.cacheStaleAfter {
             lastError = nil
+            Log.refresh.notice("refresh: held snapshot still fresh (age \(Int(snapshot.age), privacy: .public)s) — skipping call")
             return
         }
 
         if let backoffUntil, Date() < backoffUntil, !force {
             lastError = .rateLimited(retryAt: backoffUntil)
+            Log.refresh.notice("refresh: in backoff for another \(Log.secondsUntil(backoffUntil), privacy: .public)s — skipping call")
             return
         }
 
@@ -177,11 +189,13 @@ final class UsageModel: ObservableObject {
             lastError = nil
             backoffUntil = nil
             consecutiveRateLimits = 0
+            Log.refresh.notice("refresh: success via OAuth")
         } catch let failure as OAuthUsageClient.Failure {
             guard !Task.isCancelled else { return }
             switch failure {
             case .credentials(let error):
                 lastError = error
+                Log.refresh.error("refresh: failed — \(error.title, privacy: .public)")
             case .transport(let error):
                 if case .rateLimited(let retryAt) = error {
                     applyBackoff(retryAt: retryAt)

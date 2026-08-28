@@ -25,11 +25,14 @@ struct OAuthUsageClient {
 
     func fetch() async throws -> UsageSnapshot {
         guard let credentials = ClaudeCredentialStore.load() else {
+            Log.api.error("fetch: no credential available — reporting noCredentials")
             throw Failure.credentials(.noCredentials)
         }
         guard !credentials.isExpired else {
+            Log.api.error("fetch: credential is expired (fp \(Log.fingerprint(credentials.accessToken), privacy: .public), expiry \(Log.secondsUntil(credentials.expiresAt), privacy: .public)s away) — reporting credentialsExpired, waiting for Claude Code to renew")
             throw Failure.credentials(.credentialsExpired)
         }
+        Log.api.notice("fetch: requesting usage with fp \(Log.fingerprint(credentials.accessToken), privacy: .public)")
 
         var request = URLRequest(url: Self.endpoint)
         request.httpMethod = "GET"
@@ -53,21 +56,31 @@ struct OAuthUsageClient {
         switch http.statusCode {
         case 200:
             guard var snapshot = Self.parse(data) else {
+                Log.api.error("fetch: HTTP 200 but payload did not parse into any window")
                 throw Failure.transport(.noData)
             }
+            Log.api.notice("fetch: HTTP 200, \(snapshot.windows.count, privacy: .public) window(s)")
             // The plan badge isn't in the payload — it rides on the credential
             // we just used, so stamp it here rather than reading the Keychain
             // a second time from the view.
             snapshot.plan = credentials.planLabel
             return snapshot
         case 401, 403:
+            Log.api.error("fetch: HTTP \(http.statusCode, privacy: .public) — token rejected by server")
+            // The token we're holding is no longer good. Drop it so the next
+            // attempt re-reads the Keychain and picks up whatever Claude Code
+            // has refreshed it to.
+            ClaudeCredentialStore.invalidate()
             throw Failure.credentials(.credentialsExpired)
         case 404:
             // Returned for accounts without subscription-backed windows.
             throw Failure.credentials(.notSubscribed)
         case 429:
-            throw Failure.transport(.rateLimited(retryAt: Self.retryDate(from: http)))
+            let retryAt = Self.retryDate(from: http)
+            Log.api.error("fetch: HTTP 429 rate limited, Retry-After \(Log.secondsUntil(retryAt), privacy: .public)s")
+            throw Failure.transport(.rateLimited(retryAt: retryAt))
         default:
+            Log.api.error("fetch: HTTP \(http.statusCode, privacy: .public)")
             throw Failure.transport(.network("HTTP \(http.statusCode)"))
         }
     }
